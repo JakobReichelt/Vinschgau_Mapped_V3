@@ -106,8 +106,64 @@ let riverInput;
 let pathNames = [];   // all path names, A to Z
 let riverNames = [];  // all river names, A to Z
 
+const MOBILE_BREAKPOINT = 768;
+const MOBILE_SEARCH_ROW_HEIGHT = 44;
+const MOBILE_EDGE = 12;
+
+let saveSvgButton;
+let resizeTimer = null;
+let lastTouchEnd = 0;
+
+function isMobileLayout() {
+    return window.matchMedia(
+        `(max-width: ${MOBILE_BREAKPOINT}px), (pointer: coarse) and (hover: none)`
+    ).matches;
+}
+
+function hoverDistance() {
+    return isMobileLayout() ? 14 : HOVER_DISTANCE;
+}
+
+function mobileSearchBarHeight() {
+    let safeBottom = 8;
+    if (document.body && document.body.classList.contains("mobile-layout")) {
+        let inset = parseFloat(getComputedStyle(document.body).getPropertyValue("--mobile-safe-bottom"));
+        if (!isNaN(inset)) {
+            safeBottom = inset;
+        }
+    }
+    return MOBILE_SEARCH_ROW_HEIGHT * 2 + 6 + safeBottom;
+}
+
+function viewportSize() {
+    let vv = window.visualViewport;
+    if (vv) {
+        return { w: floor(vv.width), h: floor(vv.height) };
+    }
+    return { w: windowWidth, h: windowHeight };
+}
+
+function mapFitExtent() {
+    if (isMobileLayout()) {
+        let bottom = height - mobileSearchBarHeight() - MOBILE_EDGE;
+        return [
+            [MOBILE_EDGE, MOBILE_EDGE],
+            [width - MOBILE_EDGE, bottom],
+        ];
+    }
+    return [
+        [20, grid.cellH + 10],
+        [width - 20, height - grid.cellH - 10],
+    ];
+}
+
+function setMobileLayoutClass() {
+    document.body.classList.toggle("mobile-layout", isMobileLayout());
+}
+
 async function setup() {
-    createCanvas(windowWidth, windowHeight);
+    let size = viewportSize();
+    createCanvas(size.w, size.h);
     // For style.css: this canvas lies above the map pictures
     drawingContext.canvas.classList.add("sketch-canvas");
 
@@ -119,18 +175,29 @@ async function setup() {
     textFont(font);
     textSize(TEXT_SIZE);
 
-    // The grid comes first: the map has to fit between its top and bottom row
+    setMobileLayoutClass();
+    buildMap();
+    makeSearchFields();
+
+    // Leaving the canvas (also onto a search field) ends the hover preview
+    drawingContext.canvas.addEventListener("mouseleave", () => hoverLine(null));
+
+    if (window.visualViewport) {
+        window.visualViewport.addEventListener("resize", scheduleResize);
+    }
+    window.addEventListener("orientationchange", scheduleResize);
+
+    // draw() only runs while something fades (see startFading)
+    noLoop();
+}
+
+function buildMap() {
     makeGridLabels();
 
-    // Turns [longitude, latitude] into [x, y] so the map fits the canvas
-    projection = d3.geoMercator().fitExtent(
-        [
-            [20, grid.cellH + 10],
-            [width - 20, height - grid.cellH - 10],
-        ],
-        roads
-    );
+    projection = d3.geoMercator().fitExtent(mapFitExtent(), roads);
 
+    roadLines = [];
+    waterLines = [];
     for (let feature of roads.features) {
         if (isWalkway(feature)) {
             for (let line of projectLines(feature)) {
@@ -144,26 +211,53 @@ async function setup() {
         }
     }
 
+    waterLabels = [];
     makeWaterLabels();
     makeHitGrid();
+    replacePictures();
+
+    if (!roadFade || roadFade.opacity.length !== roadLines.length) {
+        roadFade = makeFade(roadLines.length, PATH_MIN_OPACITY);
+        waterFade = makeFade(waterLines.length, WATER_MIN_OPACITY);
+    }
+    updateOpacity();
+}
+
+function replacePictures() {
+    if (fullPicture) {
+        fullPicture.remove();
+    }
+    if (dimPicture) {
+        dimPicture.remove();
+    }
     fullPicture = makePicture(1, 1);
     dimPicture = makePicture(PATH_MIN_OPACITY, WATER_MIN_OPACITY);
-    // p5 hides pictures made with createGraphics(). Both stay visible,
-    // only the opacity of dimPicture changes. It lies on top of fullPicture
-    // because it is made later (same z-index in style.css).
     fullPicture.canvas.style.display = "block";
     dimPicture.canvas.style.display = "block";
-    dimPicture.canvas.style.opacity = 0;
-    roadFade = makeFade(roadLines.length, PATH_MIN_OPACITY);
-    waterFade = makeFade(waterLines.length, WATER_MIN_OPACITY);
-    updateOpacity();
+    dimPicture.canvas.style.opacity = dimAmount;
+}
+
+function scheduleResize() {
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(resizeSketch, 250);
+}
+
+function windowResized() {
+    scheduleResize();
+}
+
+function resizeSketch() {
+    if (!roads) {
+        return;
+    }
+    let size = viewportSize();
+    resizeCanvas(size.w, size.h);
+    textFont(font);
+    textSize(TEXT_SIZE);
+    setMobileLayoutClass();
+    buildMap();
     makeSearchFields();
-
-    // Leaving the canvas (also onto a search field) ends the hover preview
-    drawingContext.canvas.addEventListener("mouseleave", () => hoverLine(null));
-
-    // draw() only runs while something fades (see startFading)
-    noLoop();
+    startFading();
 }
 
 function draw() {
@@ -224,9 +318,48 @@ function keyPressed() {
 }
 
 function mouseClicked(event) {
+    if (millis() - lastTouchEnd < 500) {
+        return;
+    }
+    handleMapClick(event);
+}
+
+function touchStarted(event) {
+    if (isUiTarget(event && event.target)) {
+        return;
+    }
+    return false;
+}
+
+function touchMoved() {
+    if (!hitGrid) {
+        return false;
+    }
+    hoverLine(lineUnderMouse());
+    return false;
+}
+
+function touchEnded(event) {
+    if (isUiTarget(event && event.target)) {
+        return;
+    }
+    handleMapClick(event);
+    hoverLine(null);
+    lastTouchEnd = millis();
+}
+
+function isUiTarget(target) {
+    if (!target || !target.tagName) {
+        return false;
+    }
+    let tag = target.tagName;
+    return tag === "INPUT" || tag === "BUTTON";
+}
+
+function handleMapClick(event) {
     // The data may still be loading, and clicks into a search field
     // are handled by the field itself
-    if (!hitGrid || (event && event.target.tagName === "INPUT")) {
+    if (!hitGrid || (event && isUiTarget(event.target))) {
         return;
     }
 
@@ -459,40 +592,83 @@ function fadeOpacities(lines, isShownLine, shownPoints, radius, minOpacity) {
 // ---------------------------------------------------------------
 
 function makeSearchFields() {
-    for (let item of cellItems) {
-        if (item === null) {
-            continue;
+    if (pathNames.length === 0) {
+        for (let item of cellItems) {
+            if (item === null) {
+                continue;
+            }
+            if (item.type === "path") {
+                pathNames.push(item.name);
+            } else {
+                riverNames.push(item.name);
+            }
         }
-        if (item.type === "path") {
-            pathNames.push(item.name);
-        } else {
-            riverNames.push(item.name);
-        }
+        pathNames.sort();
+        riverNames.sort();
     }
-    pathNames.sort();
-    riverNames.sort();
 
-    pathInput = makeSearchField(pathNames, grid.rows - 1, LEFT, "#ffffff", "Search a path …", selectPath);
-    riverInput = makeSearchField(riverNames, grid.rows - 1, RIGHT, "#6464ff", "Search a river …", selectRiver);
-    riverInput.addClass("river-field");
+    if (!pathInput) {
+        pathInput = makeSearchField(pathNames, grid.rows - 1, LEFT, "#ffffff", "Search a path …", selectPath);
+        riverInput = makeSearchField(riverNames, grid.rows - 1, RIGHT, "#6464ff", "Search a river …", selectRiver);
+        riverInput.addClass("river-field");
+    }
+    layoutSearchFields();
+    makeMobileChrome();
+}
+
+function layoutSearchFields() {
+    if (!pathInput) {
+        return;
+    }
+    let row = grid.rows - 1;
+    if (isMobileLayout()) {
+        let rowH = MOBILE_SEARCH_ROW_HEIGHT;
+        let gap = 6;
+        let x = MOBILE_EDGE;
+        let w = width - MOBILE_EDGE * 2;
+        let pathY = height - rowH - mobileSearchBarHeight() + rowH + gap;
+        let riverY = pathY - gap - rowH;
+        layoutSearchField(pathInput, x, pathY, w, rowH, LEFT, row);
+        layoutSearchField(riverInput, x, riverY, w, rowH, RIGHT, row);
+        pathInput.style("text-align", "left");
+        riverInput.style("text-align", "left");
+    } else {
+        layoutSearchField(pathInput, 0, row * grid.cellH, width / 2, grid.cellH, LEFT, row);
+        layoutSearchField(riverInput, width / 2, row * grid.cellH, width / 2, grid.cellH, RIGHT, row);
+        pathInput.style("text-align", "left");
+        riverInput.style("text-align", "right");
+    }
+}
+
+function layoutSearchField(input, x, y, w, h, side, row) {
+    input.position(x, y);
+    input.size(w, h);
+    let layout = rowTextLayout(row, side, h);
+    input.style("font-size", layout.size + "px");
+}
+
+function makeMobileChrome() {
+    if (!saveSvgButton) {
+        saveSvgButton = createButton("Save SVG");
+        saveSvgButton.addClass("save-svg-btn");
+        saveSvgButton.attribute("type", "button");
+        saveSvgButton.mousePressed(saveSvg);
+    }
+    saveSvgButton.style("display", isMobileLayout() ? "block" : "none");
 }
 
 // An <input> over the left (side LEFT) or right (side RIGHT) half of a
 // grid row. onPick(name) is called whenever the field shows a name
 // (or null when no name fits).
 function makeSearchField(names, row, side, textColor, placeholder, onPick) {
-    let layout = rowTextLayout(row, side);
     let input = createInput("");
     input.attribute("placeholder", placeholder);
+    input.attribute("enterkeyhint", "search");
     // No suggestion list from the browser
     input.attribute("autocomplete", "off");
     input.attribute("spellcheck", "false");
     input.addClass("search-field");
-    input.position(side === LEFT ? 0 : width / 2, row * grid.cellH);
-    input.size(width / 2, grid.cellH);
-    input.style("font-size", layout.size + "px");
     input.style("color", textColor);
-    input.style("text-align", side === LEFT ? "left" : "right");
 
     let typed = "";    // what was really typed (without the completed part)
     let matches = [];  // all names that start with it
@@ -684,10 +860,14 @@ function lineUnderMouse() {
     if (mouseX < 0 || mouseX >= width || mouseY < 0 || mouseY >= height) {
         return null;
     }
+    if (isMobileLayout() && mouseY >= height - mobileSearchBarHeight()) {
+        return null;
+    }
     let best = null;
-    let bestDist = HOVER_DISTANCE;
-    for (let row = hitRow(mouseY - HOVER_DISTANCE); row <= hitRow(mouseY + HOVER_DISTANCE); row++) {
-        for (let col = hitCol(mouseX - HOVER_DISTANCE); col <= hitCol(mouseX + HOVER_DISTANCE); col++) {
+    let bestDist = hoverDistance();
+    let reach = bestDist;
+    for (let row = hitRow(mouseY - reach); row <= hitRow(mouseY + reach); row++) {
+        for (let col = hitCol(mouseX - reach); col <= hitCol(mouseX + reach); col++) {
             let pieces = hitGrid.cells[row * hitGrid.cols + col];
             if (pieces === undefined) {
                 continue;
@@ -1119,14 +1299,17 @@ function drawLabel(g, label) {
 // Text size and position so the letters (including the parts
 // below the line, like in g, p, y) fill the row from top to bottom.
 // Used for the search fields and the SVG export.
-function rowTextLayout(row, side) {
+function rowTextLayout(row, side, cellH) {
+    if (cellH === undefined) {
+        cellH = grid.cellH;
+    }
     // p5 measures ascent/descent from the current vertical alignment,
     // so it has to be BASELINE here
     textAlign(side, BASELINE);
 
     // Measure how tall the font is at size 100, then scale to the row height
     textSize(100);
-    let size = (grid.cellH * 100) / (textAscent() + textDescent());
+    let size = (cellH * 100) / (textAscent() + textDescent());
 
     textSize(size);
     let baseline = (row + 1) * grid.cellH - textDescent();
